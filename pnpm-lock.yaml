@@ -1,0 +1,23 @@
+lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .:
+    dependencies:
+      '@leolee9086/vectordb':
+        specifier: file:../s-forge/packages/vectordb-node
+        version: file:../s-forge/packages/vectordb-node
+
+packages:
+
+  '@leolee9086/vectordb@file:../s-forge/packages/vectordb-node':
+    resolution: {directory: ../s-forge/packages/vectordb-node, type: directory}
+    engines: {node: '>=20'}
+
+snapshots:
+
+  '@leolee9086/vectordb@file:../s-forge/packages/vectordb-node': {}

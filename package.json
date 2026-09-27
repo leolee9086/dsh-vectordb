@@ -1,0 +1,30 @@
+{
+  "name": "dsh-vectordb",
+  "version": "0.1.0",
+  "description": "DSH 的向量库：把 s-forge 的 ANN 引擎（DiskVamana/HNSW，stdio sidecar）接成 host 服务，供本进程内任何插件做语义检索",
+  "author": "leolee9086",
+  "license": "MIT",
+  "type": "module",
+  "main": "./src/host.js",
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "dsh": {
+    "client": {
+      "platform": "web",
+      "inject": []
+    }
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "check": "node --check src/host.js"
+  },
+  "dependencies": {
+    "@leolee9086/vectordb": "file:../s-forge/packages/vectordb-node"
+  }
+}
