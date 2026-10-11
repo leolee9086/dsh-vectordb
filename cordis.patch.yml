@@ -1,0 +1,14 @@
+# 向量库是跨会话共享的宿主能力：同一个数据库目录只能由一个侧车进程持有，
+# 每个会话各拉一个会互相抢锁，所以这一行属于宿主组合（作为 profile 的一层），不属于任何会话预设。
+#
+# 消费者通过 ctx.get('vectorStore') 取共享句柄；Dataset、多向量字段与 RRF 都由底层实现。
+# 下面只写"刻意留默认"的项，配置项清单见 src/host.js 顶部注释。
+- insert:
+    - id: dsh-vectordb
+      name: dsh-vectordb
+      config:
+        # path 留空 = <DSH_HOME>/vectors/vectordb
+        # Windows 上侧车按 SHA256 安装到 <DSH_HOME>/cache/vectordb-runtime/<hash>/，
+        # 不直接跑工作区里的可执行文件——那里可能带着低完整性标签，会连带压低子进程。
+        # 要固定二进制位置就显式给 binary 与 binaryCachePath；cacheBinary: false 表示只用现成文件。
+        requestTimeoutMs: 30000

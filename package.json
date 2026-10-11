@@ -8,6 +8,7 @@
   "main": "./src/host.js",
   "files": [
     "src",
+    "cordis.patch.yml",
     "README.md",
     "LICENSE"
   ],
@@ -15,6 +16,9 @@
     "node": ">=22.19.0"
   },
   "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
     "client": {
       "platform": "web",
       "inject": []
@@ -22,7 +26,7 @@
   },
   "scripts": {
     "test": "node --test test/*.test.js",
-    "check": "node --check src/host.js"
+    "check": "node --check src/host.js && node --check src/retrieval-contract.js"
   },
   "dependencies": {
     "@leolee9086/vectordb": "file:../s-forge/packages/vectordb-node"
