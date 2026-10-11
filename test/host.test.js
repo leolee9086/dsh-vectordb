@@ -64,7 +64,9 @@ test('同名 collection：第二次调用走 open 而不是 create（create 对�
   const dir = mkdtempSync(join(tmpdir(), 'dsh-vectordb-'))
   const ctx = fakeCtx()
   const first = createVectorStore(ctx, { path: join(dir, 'db') })
+  let second
   t.after(async () => {
+    if (second) await second.close()
     await first.close()
     rmSync(dir, { recursive: true, force: true })
   })
@@ -73,8 +75,7 @@ test('同名 collection：第二次调用走 open 而不是 create（create 对�
 
   // 换一个 store 实例（清掉句柄缓存）指向同一个库目录 —— 等价于"重启之后再来一次"。
   await first.close()
-  const second = createVectorStore(ctx, { path: join(dir, 'db') })
-  t.after(async () => { await second.close() })
+  second = createVectorStore(ctx, { path: join(dir, 'db') })
   const reopened = await second.collection('memories', { dimension: 3 })
   const hits = await reopened.search([1, 0, 0], { topK: 1 })
   assert.equal(hits[0]?.id, 'm1', '重开之后数据应当还在（也证明没走 create 那条会抛的路）')

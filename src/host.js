@@ -1,159 +1,142 @@
 /**
- * dsh-vectordb —— 把 s-forge 的 ANN 引擎接成 DSH 的 host 服务。
- *
- * **这一层只做适配，不做能力。** 能力在内核（`s-forge/packages/vectordb`，Go，DiskVamana / HNSW）
- * 与它的 Node 绑定（`@leolee9086/vectordb`，stdio sidecar）里；这里解决的是三件库不该管的事：
- *
- * 1. **进程与生命周期**：sidecar 持有数据库目录的跨进程独占锁，所以本进程内**只能有一个实例**。
- *    多个插件各开一次会互相打架（第二个拿到 `database_locked`）。这里把它收成一个懒启动的单例。
- * 2. **数据放哪**：统一放 `$DSH_HOME/vectors/`，跟 storages 一个位置，不让每个消费者自己编路径。
- * 3. **稳定契约**：对别的插件暴露 `ctx.get('vectorStore')`，而不是让它们各自 import 库。
- *
- * **别的消费者要走别的面**（MCP / HTTP / 其它 agent）时，别改这里 —— 那是在内核与 Node 绑定之上
- * 再加一张脸，跟本文件平级。这是「同一内核、多个面」那条分层。
- *
- * @module dsh-vectordb/host
+ * 把独立向量库接成共享的宿主服务。数据库目录只能由一个侧车持有，
+ * 消费者通过 ctx.get('vectorStore') 共享连接，不自行拉起进程。
+ * Dataset、多向量字段与 RRF 都由底层实现，这里只做句柄和生命周期适配。
  */
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { openVectorDB } from '@leolee9086/vectordb'
+import { prepareSidecarBinary } from './runtime-binary.js'
 
 export const name = 'dsh-vectordb'
-
-/**
- * 服务名。别的插件用 `ctx.get('vectorStore')` 取（未声明的可选依赖必须用 ctx.get，
- * 不是 ctx.vectorStore —— 属性代理只认声明过的注入）。
- */
 export const SERVICE = 'vectorStore'
 
-/** 默认的库文件位置：跟 storages 并列，别散在工作区里。 */
 function defaultPath() {
-  const home = process.env.DSH_HOME ?? join(homedir(), '.dsh')
-  return join(home, 'vectors', 'vectordb')
+  return join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'vectors', 'vectordb')
 }
 
 /**
- * 装这个服务。
- *
- * @param {object} ctx 插件上下文。
- * @param {object} [raw] 配置。
- * @param {string} [raw.path] 库目录，默认 `$DSH_HOME/vectors/vectordb`。
- * @param {boolean} [raw.autoRestart] sidecar 意外退出后是否自动拉起，默认 true。
- * @returns {object} 服务对象。
+ * 配置：path、binary、binaryCachePath、cacheBinary、requestTimeoutMs。
+ * Windows 默认把包里的侧车安装到宿主缓存；关闭后的 store 不再接受新请求。
+ * 意外退出必须显式重开整个库，不能只重启空侧车后继续使用旧句柄。
  */
 export function createVectorStore(ctx, raw = {}) {
   const path = typeof raw.path === 'string' && raw.path !== '' ? raw.path : defaultPath()
-  const autoRestart = raw.autoRestart !== false
-
-  /** 已打开的库（懒启动后的单例）。 */
   let db = null
-  /** 正在打开的那次；并发调用共享它，避免同时拉起两个 sidecar。 */
   let opening = null
-  /** 已拿到的 collection 句柄，按名字缓存 —— 句柄本身是幂等的。 */
-  const handles = new Map()
-
-  const log = (message) => {
-    // sidecar 的 stderr 原样转成宿主日志：出问题时能在这里看到它自己的说法。
-    if (typeof ctx.logger?.info === 'function') ctx.logger.info('dsh-vectordb: ' + message)
+  let closing = null
+  let disposed = false
+  const collections = new Map()
+  const datasets = new Map()
+  const assertActive = () => {
+    if (disposed) throw new Error('vectorStore 已关闭')
   }
+  const log = (message) => ctx.logger?.info?.('dsh-vectordb: ' + message)
 
-  async function ensureDb() {
-    if (db !== null) return db
+  function ensureDb() {
+    assertActive()
+    if (db !== null) return Promise.resolve(db)
     if (opening !== null) return opening
-    opening = openVectorDB({ path, autoRestart, onLog: log })
-      .then((opened) => {
-        db = opened
-        opening = null
-        return opened
+    opening = (async () => {
+      const binary = await prepareSidecarBinary(raw)
+      const opened = await openVectorDB({
+        path, binary, autoRestart: false,
+        requestTimeoutMs: raw.requestTimeoutMs ?? 30000,
+        onLog: log,
       })
-      .catch((error) => {
-        opening = null
-        throw error
-      })
+      db = opened
+      return opened
+    })().finally(() => { opening = null })
     return opening
   }
 
-  /**
-   * 拿一个 collection 句柄。同名重复调用返回同一个句柄。
-   *
-   * 建库与开库分开判断：`createCollection` 对已存在的名字会抛，所以先列一次再决定建还是开 ——
-   * 这样调用方不用关心"这是第一次还是第二次"。
-   *
-   * @param {string} name collection 名。
-   * @param {object} [options] 第一次创建时的选项。
-   * @param {number} options.dimension 维度（建库必填）。
-   * @param {string} [options.metric] `l2` / `cosine` / `ip`，默认 cosine。
-   * @param {string} [options.engine] `disk-vamana` / `hnsw`，默认 hnsw。
-   * @param {Array<object>} [options.initialPoints] DiskVamana 建库必须给初始点集。
-   * @returns {Promise<object>} collection 句柄。
-   */
-  async function collection(nm, options = {}) {
-    const cached = handles.get(nm)
-    if (cached !== undefined) return cached
-    const opened = await ensureDb()
-    const existing = await opened.listCollections()
-    const names = (Array.isArray(existing) ? existing : []).map((item) => (typeof item === 'string' ? item : item?.name))
-    const handle = names.includes(nm)
-      ? await opened.openCollection(nm)
-      : await opened.createCollection(nm, {
+  // 缓存的是正在打开的 Promise：两个消费者第一次同时请求时也只有一次 create。
+  function cached(map, nm, operation) {
+    assertActive()
+    if (typeof nm !== 'string' || !nm.trim()) return Promise.reject(new Error('名称不能为空'))
+    if (map.has(nm)) return map.get(nm)
+    const pending = operation().catch((error) => {
+      if (map.get(nm) === pending) map.delete(nm)
+      throw error
+    })
+    map.set(nm, pending)
+    return pending
+  }
+
+  function collection(nm, options = {}) {
+    return cached(collections, nm, async () => {
+      const opened = await ensureDb()
+      const names = (await opened.listCollections()).map((item) => typeof item === 'string' ? item : item.name)
+      return names.includes(nm) ? opened.openCollection(nm) : opened.createCollection(nm, {
         engine: options.engine ?? 'hnsw',
         dimension: options.dimension,
-        distanceMetric: options.metric ?? 'cosine',
+        distanceMetric: options.distanceMetric ?? options.metric ?? 'cosine',
         ...(options.initialPoints === undefined ? {} : { initialPoints: options.initialPoints }),
       })
-    handles.set(nm, handle)
-    return handle
+    })
+  }
+
+  function dataset(nm, options) {
+    const pending = cached(datasets, nm, async () => {
+      const opened = await ensureDb()
+      const names = (await opened.listDatasets()).map((item) => item.name)
+      if (!names.includes(nm)) {
+        if (!options?.embeddings) throw new Error('创建 dataset 需要 embeddings 字段定义')
+        return opened.createDataset(nm, options)
+      }
+      return opened.openDataset(nm)
+    })
+    if (!options?.embeddings) return pending
+    return pending.then(async (handle) => {
+      // 包括命中缓存的调用：相同名字不同维度不能悄悄复用。
+      const stats = await handle.stats()
+      for (const [field, schema] of Object.entries(options.embeddings)) {
+        const existing = stats.embeddings?.[field]
+        if (!existing || existing.dimension !== schema.dimension ||
+            (existing.distanceMetric || 'cosine') !== (schema.distanceMetric || 'cosine')) {
+          throw new Error('dataset 字段契约不匹配：' + nm + '/' + field)
+        }
+      }
+      return handle
+    })
   }
 
   return {
-    /** 库文件在哪 —— 诊断时想知道"数据到底写哪了"。 */
     path,
-    /** 库开没开（懒启动后才有意义）。 */
-    isOpen: () => db !== null,
+    isOpen: () => db !== null && !disposed,
     collection,
-    /** 列出现有的 collection 名。 */
+    dataset,
     async list() {
-      const opened = await ensureDb()
-      const existing = await opened.listCollections()
-      return (Array.isArray(existing) ? existing : []).map((item) => (typeof item === 'string' ? item : item?.name))
+      return (await (await ensureDb()).listCollections()).map((item) => typeof item === 'string' ? item : item.name)
     },
-    /** 合并 WAL 与墓碑、原子发布新代际。写多了之后调一次。 */
+    async listDatasets() {
+      return (await ensureDb()).listDatasets()
+    },
     async checkpoint(nm) {
-      const handle = await collection(nm)
-      return handle.checkpoint()
+      return (await collection(nm)).checkpoint()
     },
-    /** 关库并收掉 sidecar 进程。正常卸载时由 ctx.effect 调，不需要手动调。 */
-    async close() {
-      const current = db
-      db = null
-      handles.clear()
-      if (current === null) return
-      await current.close()
+    close() {
+      if (closing !== null) return closing
+      disposed = true
+      closing = (async () => {
+        // 包括 close 与首次 open 并发的情形：先等已开始的打开，再释放唯一连接。
+        await Promise.allSettled([opening, ...collections.values(), ...datasets.values()])
+        const current = db
+        db = null
+        collections.clear()
+        datasets.clear()
+        if (current !== null) await current.close()
+      })()
+      return closing
     },
   }
 }
 
-/**
- * 插件入口。
- *
- * 不声明任何 `inject`：本插件不依赖别的服务，别的插件依赖它。
- * 卸载时通过 `ctx.effect` 把 sidecar 收干净 —— 不清的话进程会留下一个孤儿。
- *
- * @param {object} ctx 插件上下文。
- * @param {object} [config] 见 {@link createVectorStore}。
- */
 export function apply(ctx, config = {}) {
+  if (ctx.get(SERVICE) !== undefined) throw new Error('vectorStore 已由其他插件提供')
   const store = createVectorStore(ctx, config)
-  // 服务名全局唯一：已经有了就不再注册（同一个进程里注册两次会让插件挂载失败）。
-  if (ctx.get(SERVICE) === undefined) {
-    ctx.provide(SERVICE, store)
-  }
+  ctx.provide(SERVICE, store)
   ctx.effect(() => () => {
-    // 卸载是同步的，关库是异步的：不阻塞卸载，但失败了要留下痕迹。
-    void store.close().catch((error) => {
-      if (typeof ctx.logger?.warn === 'function') {
-        ctx.logger.warn('dsh-vectordb: 关库时出错: ' + (error instanceof Error ? error.message : String(error)))
-      }
-    })
+    void store.close().catch((error) => ctx.logger?.warn?.('dsh-vectordb: 关闭失败：' + error.message))
   }, 'dsh-vectordb: 收掉 sidecar')
 }
