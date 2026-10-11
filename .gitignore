@@ -1,3 +1,5 @@
 node_modules/
 .probe/
 *.log
+# 记忆库备份含真实记忆正文，只在本机留存，绝不进版本库。
+backups/
