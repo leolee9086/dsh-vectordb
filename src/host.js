@@ -7,7 +7,9 @@ import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { openVectorDB } from '@leolee9086/vectordb'
 import { prepareSidecarBinary } from './runtime-binary.js'
+import * as retrieval from './retrieval-contract.js'
 
+export { retrieval }
 export const name = 'dsh-vectordb'
 export const SERVICE = 'vectorStore'
 
@@ -103,6 +105,7 @@ export function createVectorStore(ctx, raw = {}) {
 
   return {
     path,
+    retrieval,
     isOpen: () => db !== null && !disposed,
     collection,
     dataset,
